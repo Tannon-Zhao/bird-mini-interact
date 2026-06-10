@@ -154,6 +154,107 @@ def _extract_json_from_text(text: str) -> Optional[dict]:
     return None
 
 
+# Known BIRD-Interact tool names (used by the native tool_call fallback parser).
+_KNOWN_TOOLS = (
+    "execute",
+    "get_schema",
+    "get_all_column_meanings",
+    "get_column_meaning",
+    "get_all_external_knowledge_names",
+    "get_knowledge_definition",
+    "get_all_knowledge_definitions",
+    "ask",
+    "submit",
+)
+
+
+def _extract_bare_json_dict(text: str) -> Optional[dict]:
+    """Return the first balanced {...} that parses to a dict (any keys)."""
+    start = text.find('{')
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        start = text.find('{', start + 1)
+    return None
+
+
+def _try_parse_native_toolcall_fallback(response: str) -> Optional[Tuple[str, str, str, dict]]:
+    """
+    Tolerant fallback for provider-native tool-call styles that are NOT our
+    {"name":..,"arguments":..} JSON. Notably GLM emits shapes like:
+        <tool_call>get_schema
+        <tool_call>execute</arg_value>arguments</arg_key><arg_value>{"sql":"..."}</arg_value>
+        <tool_call>get_column_meaning\ntable_name: signals\ncolumn_name: interflvl
+        <tool_call>execute("SELECT ...")
+    Returns (thought, interaction_object, action, tool_data) or None.
+    """
+    if "<tool_call>" not in response:
+        return None
+
+    seg = response.split("<tool_call>", 1)[1]
+    seg = seg.split("</tool_call>", 1)[0]  # cut trailing close tag if present
+
+    thought = ""
+    m = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+    if m:
+        thought = m.group(1).strip()
+
+    # Resolve the tool name: prefer the leading identifier, else first known tool word.
+    name = None
+    head = seg.lstrip()
+    mname = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)', head)
+    if mname and mname.group(1) in _KNOWN_TOOLS:
+        name = mname.group(1)
+    else:
+        for tn in _KNOWN_TOOLS:
+            if re.search(r'\b' + re.escape(tn) + r'\b', seg):
+                name = tn
+                break
+    if name is None:
+        return None
+
+    # Resolve arguments from (in priority order): embedded JSON, name(...) literal, YAML kv.
+    args: dict = {}
+    j = _extract_bare_json_dict(seg)
+    if isinstance(j, dict):
+        if isinstance(j.get("arguments"), dict):
+            args = j["arguments"]
+        elif "name" in j:
+            args = {}
+        else:
+            args = j
+    else:
+        mlit = re.search(re.escape(name) + r'\((.*)\)', seg, re.DOTALL)
+        if mlit:
+            inner = mlit.group(1).strip()
+            if inner and inner != "{}":
+                inner_s = inner.strip().strip('\'"')
+                if name in ("execute", "submit"):
+                    args = {"sql": inner_s}
+                elif name == "ask":
+                    args = {"question": inner_s}
+        if not args:
+            for line in seg.splitlines():
+                mkv = re.match(r'\s*([a-zA-Z_]+)\s*:\s*(.+)', line)
+                if mkv and mkv.group(1) in ("sql", "question", "table_name", "column_name", "knowledge_name"):
+                    args[mkv.group(1)] = mkv.group(2).strip().strip('\'"')
+
+    interaction_object, action = _convert_tool_call_to_action(name, args)
+    return thought, interaction_object, action, {"name": name, "arguments": args}
+
+
 def _try_parse_tool_call_format(response: str) -> Optional[Tuple[str, str, str]]:
     """
     Try to parse <tool_call> JSON format (from function-calling SFT models).
@@ -209,6 +310,11 @@ def parse_agent_response_ex(response: str) -> Tuple[str, str, str, Optional[dict
         thought, interaction_object, action = tool_call_result
         tool_data = _extract_json_from_text(response)
         return thought, interaction_object, action, tool_data
+
+    # --- Tolerant fallback for provider-native tool-call styles (e.g. GLM) ---
+    native_result = _try_parse_native_toolcall_fallback(response)
+    if native_result is not None:
+        return native_result
 
     thought, interaction_object, action = _parse_react_format(response)
     return thought, interaction_object, action, None
