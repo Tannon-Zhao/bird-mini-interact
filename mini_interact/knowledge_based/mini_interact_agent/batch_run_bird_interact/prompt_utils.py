@@ -225,17 +225,36 @@ def _try_parse_native_toolcall_fallback(response: str) -> Optional[Tuple[str, st
     if name is None:
         return None
 
-    # Resolve arguments from (in priority order): embedded JSON, name(...) literal, YAML kv.
+    # Resolve arguments. Priority:
+    #   (1) GLM <arg_key>K</arg_key><arg_value>V</arg_value> pairs (V may be raw text)
+    #   (2) embedded JSON dict   (3) name(...) literal   (4) YAML kv lines
     args: dict = {}
-    j = _extract_bare_json_dict(seg)
-    if isinstance(j, dict):
-        if isinstance(j.get("arguments"), dict):
-            args = j["arguments"]
-        elif "name" in j:
-            args = {}
-        else:
-            args = j
-    else:
+    _ARG_KEYS = ("sql", "question", "table_name", "column_name", "knowledge_name")
+
+    # (1) <arg_key>/<arg_value> pairs; tolerate a missing closing </arg_value> (truncation).
+    arg_pairs = re.findall(r'<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>', seg, re.DOTALL)
+    if not arg_pairs:
+        m2 = re.search(r'<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*)$', seg, re.DOTALL)
+        if m2:
+            arg_pairs = [(m2.group(1), m2.group(2))]
+    for k, v in arg_pairs:
+        k = k.strip(); v = v.strip()
+        if k in ("table_name", "column_name", "knowledge_name"):
+            v = v.strip('\'"')
+        if k in _ARG_KEYS:
+            args[k] = v
+
+    # (2) embedded JSON dict
+    if not args:
+        j = _extract_bare_json_dict(seg)
+        if isinstance(j, dict):
+            if isinstance(j.get("arguments"), dict):
+                args = j["arguments"]
+            elif "name" not in j:
+                args = j
+
+    # (3) name(...) literal
+    if not args:
         mlit = re.search(re.escape(name) + r'\((.*)\)', seg, re.DOTALL)
         if mlit:
             inner = mlit.group(1).strip()
@@ -245,11 +264,13 @@ def _try_parse_native_toolcall_fallback(response: str) -> Optional[Tuple[str, st
                     args = {"sql": inner_s}
                 elif name == "ask":
                     args = {"question": inner_s}
-        if not args:
-            for line in seg.splitlines():
-                mkv = re.match(r'\s*([a-zA-Z_]+)\s*:\s*(.+)', line)
-                if mkv and mkv.group(1) in ("sql", "question", "table_name", "column_name", "knowledge_name"):
-                    args[mkv.group(1)] = mkv.group(2).strip().strip('\'"')
+
+    # (4) YAML-ish "key: value" lines
+    if not args:
+        for line in seg.splitlines():
+            mkv = re.match(r'\s*([a-zA-Z_]+)\s*:\s*(.+)', line)
+            if mkv and mkv.group(1) in _ARG_KEYS:
+                args[mkv.group(1)] = mkv.group(2).strip().strip('\'"')
 
     interaction_object, action = _convert_tool_call_to_action(name, args)
     return thought, interaction_object, action, {"name": name, "arguments": args}
