@@ -117,9 +117,12 @@ def build_native_initial_messages(status, budget_info: dict, env_type: str) -> L
     """Construct [system, user(query)] and store on status.native_base_messages."""
     tmpl = TemplateNativeFnCallBirdInteract(LANGUAGE_MAP[env_type], SETTING_MAP[env_type])
     query = status.original_data["amb_user_query"]
+    # First user message = native toy demo (loss-free context) + real query + budget note.
+    # Shared verbatim with the SFT converter so training distribution == eval protocol.
+    user_content = tmpl.get_demos_native() + "\n\n" + tmpl.get_query_msg(query, budget_info)
     messages = [
         {"role": "system", "content": tmpl.get_native_init_msg()},
-        {"role": "user", "content": tmpl.get_query_msg(query, budget_info)},
+        {"role": "user", "content": user_content},
     ]
     status.native_base_messages = messages
     return messages
