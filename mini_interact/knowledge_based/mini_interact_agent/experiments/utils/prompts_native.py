@@ -127,7 +127,6 @@ User's Question: Find several calibrated alien signals detected by the observato
 
 <tool_response>
 <name>get_schema</name>
-<id>chatcmpltooldemo000001</id>
 <result>
 Database schema showing tables: Observatories(ObservID, ObservStation, ObservDate, LunarStage, Signal), Signals(SignalID, SignalType, SignalStrength)...
 
@@ -141,7 +140,6 @@ Database schema showing tables: Observatories(ObservID, ObservStation, ObservDat
 
 <tool_response>
 <name>get_column_meaning</name>
-<id>chatcmpltooldemo000002</id>
 <result>
 Full name: 'Lunar Stage'. Explanation: Current lunar phase during observation. Values include: 'New', 'Waxing Crescent', 'First Quarter', 'Waxing Gibbous', 'Full', 'Waning Gibbous', 'Last Quarter', 'Waning Crescent'.
 
@@ -155,7 +153,6 @@ Full name: 'Lunar Stage'. Explanation: Current lunar phase during observation. V
 
 <tool_response>
 <name>get_all_external_knowledge_names</name>
-<id>chatcmpltooldemo000003</id>
 <result>
 ["Alien Signal Classification", "Lunar Phase Effects", "Calibrated Signal"]
 
@@ -169,7 +166,6 @@ Full name: 'Lunar Stage'. Explanation: Current lunar phase during observation. V
 
 <tool_response>
 <name>get_knowledge_definition</name>
-<id>chatcmpltooldemo000004</id>
 <result>
 {"id": 3, "knowledge": "Calibrated Signal", "description": "Definition of calibrated signal", "definition": "Those signal with strength > 10."}
 
@@ -183,7 +179,6 @@ Full name: 'Lunar Stage'. Explanation: Current lunar phase during observation. V
 
 <tool_response>
 <name>ask</name>
-<id>chatcmpltooldemo000005</id>
 <result>
 I want three results sorted by signal strength.
 
@@ -197,7 +192,6 @@ I want three results sorted by signal strength.
 
 <tool_response>
 <name>ask</name>
-<id>chatcmpltooldemo000006</id>
 <result>
 I just want the signal id.
 
@@ -211,7 +205,6 @@ I just want the signal id.
 
 <tool_response>
 <name>execute</name>
-<id>chatcmpltooldemo000007</id>
 <result>
 [(12,), (11,), (10,)]
 
@@ -225,7 +218,6 @@ I just want the signal id.
 
 <tool_response>
 <name>submit</name>
-<id>chatcmpltooldemo000008</id>
 <result>
 Your SQL is correct! Now, here's a follow-up question from user: Can you also count how many distinct calibrated signals were detected during full moon phases?
 
