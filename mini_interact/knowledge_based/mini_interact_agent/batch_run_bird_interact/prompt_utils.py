@@ -56,11 +56,314 @@ def get_agent_prompt_for_turn(sample_status: 'SampleStatus') -> str:
     # The interaction history is used to build the rest
     return sample_status.get_full_interaction_prompt()
 
+
+def build_initial_agent_prompt_dispatch(sample_status: 'SampleStatus', budget_info: Dict,
+                                        env_type: str = "bird_interact_sql",
+                                        chat_mode: str = "react_text"):
+    """Dispatch initial-prompt construction by agent chat mode.
+
+    react_text  -> legacy single-string ReAct prompt (stored in current_prompt)
+    native_fncall -> demo-style [system, user] messages (stored in native_base_messages)
+    Returns whatever the chosen builder returns (str or messages list).
+    """
+    if chat_mode == "native_fncall":
+        from batch_run_bird_interact.native_messages_builder import build_native_initial_messages
+        msgs = build_native_initial_messages(sample_status, budget_info, env_type)
+        sample_status.current_prompt = ""  # not used in native mode
+        return msgs
+    return build_initial_agent_prompt(sample_status, budget_info, env_type)
+
+def _convert_tool_call_to_action(name: str, arguments: dict) -> Tuple[str, str]:
+    """
+    Convert a tool_call JSON (name + arguments) into (interaction_object, action_string).
+    Handles both direct format {"name":"get_schema",...} and nested format
+    {"name":"Environment","arguments":{"action":"get_schema"}}.
+    """
+    if name in ("Environment", "User"):
+        interaction_object = name
+        inner_action = arguments.get("action", "")
+        if inner_action:
+            inner_args = {k: v for k, v in arguments.items() if k != "action"}
+            return interaction_object, _format_action_call(inner_action, inner_args)
+        if "question" in arguments:
+            return "User", f"ask('{arguments['question']}')"
+        if "sql" in arguments:
+            return "User", f'submit("{arguments["sql"]}")'
+        return interaction_object, "get_schema()"
+
+    if name in ("ask", "submit"):
+        interaction_object = "User"
+    else:
+        interaction_object = "Environment"
+    return interaction_object, _format_action_call(name, arguments)
+
+
+def _format_action_call(name: str, arguments: dict) -> str:
+    """Format a function name + arguments dict into a callable action string."""
+    if name == "get_schema":
+        return "get_schema()"
+    elif name == "execute":
+        sql = arguments.get("sql", "")
+        return f'execute("{sql}")'
+    elif name == "ask":
+        question = arguments.get("question", "")
+        return f"ask('{question}')"
+    elif name == "submit":
+        sql = arguments.get("sql", "")
+        return f'submit("{sql}")'
+    elif name == "get_all_column_meanings":
+        return "get_all_column_meanings()"
+    elif name == "get_column_meaning":
+        table = arguments.get("table_name", "")
+        column = arguments.get("column_name", "")
+        return f"get_column_meaning('{table}', '{column}')"
+    elif name == "get_all_external_knowledge_names":
+        return "get_all_external_knowledge_names()"
+    elif name == "get_knowledge_definition":
+        kname = arguments.get("knowledge_name", "")
+        return f"get_knowledge_definition('{kname}')"
+    elif name == "get_all_knowledge_definitions":
+        return "get_all_knowledge_definitions()"
+    else:
+        args_str = ", ".join(f"'{v}'" for v in arguments.values()) if arguments else ""
+        return f"{name}({args_str})"
+
+
+def _extract_json_from_text(text: str) -> Optional[dict]:
+    """
+    Extract the first valid JSON object containing a "name" key from text.
+    Handles nested braces (e.g. "arguments": {}).
+    """
+    start = text.find('{"name"')
+    if start == -1:
+        start = text.find("{'name")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i+1])
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
+# Known BIRD-Interact tool names (used by the native tool_call fallback parser).
+_KNOWN_TOOLS = (
+    "execute",
+    "get_schema",
+    "get_all_column_meanings",
+    "get_column_meaning",
+    "get_all_external_knowledge_names",
+    "get_knowledge_definition",
+    "get_all_knowledge_definitions",
+    "ask",
+    "submit",
+)
+
+
+def _extract_bare_json_dict(text: str) -> Optional[dict]:
+    """Return the first balanced {...} that parses to a dict (any keys)."""
+    start = text.find('{')
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        start = text.find('{', start + 1)
+    return None
+
+
+def _try_parse_native_toolcall_fallback(response: str) -> Optional[Tuple[str, str, str, dict]]:
+    """
+    Tolerant fallback for provider-native tool-call styles that are NOT our
+    {"name":..,"arguments":..} JSON. Notably GLM emits shapes like:
+        <tool_call>get_schema
+        <tool_call>execute</arg_value>arguments</arg_key><arg_value>{"sql":"..."}</arg_value>
+        <tool_call>get_column_meaning\ntable_name: signals\ncolumn_name: interflvl
+        <tool_call>execute("SELECT ...")
+    Returns (thought, interaction_object, action, tool_data) or None.
+    """
+    if "<tool_call>" not in response:
+        return None
+
+    seg = response.split("<tool_call>", 1)[1]
+    seg = seg.split("</tool_call>", 1)[0]  # cut trailing close tag if present
+
+    thought = ""
+    m = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+    if m:
+        thought = m.group(1).strip()
+
+    # Resolve the tool name: prefer the leading identifier, else first known tool word.
+    name = None
+    head = seg.lstrip()
+    mname = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)', head)
+    if mname and mname.group(1) in _KNOWN_TOOLS:
+        name = mname.group(1)
+    else:
+        for tn in _KNOWN_TOOLS:
+            if re.search(r'\b' + re.escape(tn) + r'\b', seg):
+                name = tn
+                break
+    if name is None:
+        return None
+
+    # Resolve arguments. Priority:
+    #   (1) GLM <arg_key>K</arg_key><arg_value>V</arg_value> pairs (V may be raw text)
+    #   (2) embedded JSON dict   (3) name(...) literal   (4) YAML kv lines
+    args: dict = {}
+    _ARG_KEYS = ("sql", "question", "table_name", "column_name", "knowledge_name")
+
+    # (1) <arg_key>/<arg_value> pairs; tolerate missing closing tags.
+    # (1a) Fully tagged: <arg_key>K</arg_key><arg_value>V</arg_value>
+    arg_pairs = re.findall(r'<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>', seg, re.DOTALL)
+    # (1b) Missing </arg_value> (truncation): <arg_key>K</arg_key><arg_value>V...
+    if not arg_pairs:
+        m2 = re.search(r'<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*)$', seg, re.DOTALL)
+        if m2:
+            arg_pairs = [(m2.group(1), m2.group(2))]
+    # (1c) Missing </arg_key> entirely (GLM quirk): <arg_key>KEY": "VALUE or KEY: VALUE
+    if not arg_pairs:
+        raw_pairs = re.findall(r'<arg_key>\s*(\w+)["\'\s:]+(.+?)(?=<arg_key>|</?\w|$)', seg, re.DOTALL)
+        for rk, rv in raw_pairs:
+            rk = rk.strip()
+            rv = rv.strip().rstrip('"\'\s\n').strip()
+            if rk in _ARG_KEYS:
+                arg_pairs.append((rk, rv))
+    for k, v in arg_pairs:
+        k = k.strip(); v = v.strip()
+        if k in ("table_name", "column_name", "knowledge_name"):
+            v = v.strip('\'"')
+        if k in _ARG_KEYS:
+            args[k] = v
+
+    # (2) embedded JSON dict
+    if not args:
+        j = _extract_bare_json_dict(seg)
+        if isinstance(j, dict):
+            if isinstance(j.get("arguments"), dict):
+                args = j["arguments"]
+            elif "name" not in j:
+                args = j
+
+    # (3) name(...) literal
+    if not args:
+        mlit = re.search(re.escape(name) + r'\((.*)\)', seg, re.DOTALL)
+        if mlit:
+            inner = mlit.group(1).strip()
+            if inner and inner != "{}":
+                inner_s = inner.strip().strip('\'"')
+                if name in ("execute", "submit"):
+                    args = {"sql": inner_s}
+                elif name == "ask":
+                    args = {"question": inner_s}
+
+    # (4) YAML-ish "key: value" lines
+    if not args:
+        for line in seg.splitlines():
+            mkv = re.match(r'\s*([a-zA-Z_]+)\s*:\s*(.+)', line)
+            if mkv and mkv.group(1) in _ARG_KEYS:
+                args[mkv.group(1)] = mkv.group(2).strip().strip('\'"')
+
+    interaction_object, action = _convert_tool_call_to_action(name, args)
+    return thought, interaction_object, action, {"name": name, "arguments": args}
+
+
+def _try_parse_tool_call_format(response: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Try to parse <tool_call> JSON format (from function-calling SFT models).
+    Returns (thought, interaction_object, action) if successful, None otherwise.
+    """
+    if "<tool_call>" not in response and '"name"' not in response:
+        return None
+
+    # Extract thought from <think> tags (Qwen-style thinking)
+    thought = ""
+    think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+    if think_match:
+        thought = think_match.group(1).strip()
+    elif '<think>' in response:
+        after_think = response.split('<think>', 1)[1]
+        before_tool = after_think.split('<tool_call>', 1)[0] if '<tool_call>' in after_think else after_think
+        candidate = before_tool.strip()
+        if candidate and not candidate.startswith('{'):
+            thought = candidate
+
+    # Try to extract JSON: first from <tool_call>...</tool_call>, then from full response
+    tool_data = None
+    tc_match = re.search(r'<tool_call>(.*?)</tool_call>', response, re.DOTALL)
+    if tc_match:
+        tool_data = _extract_json_from_text(tc_match.group(1))
+
+    if tool_data is None:
+        tool_data = _extract_json_from_text(response)
+
+    if tool_data is None:
+        return None
+
+    name = tool_data.get("name", "")
+    arguments = tool_data.get("arguments", {})
+    if not name:
+        return None
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    interaction_object, action = _convert_tool_call_to_action(name, arguments)
+    return thought, interaction_object, action
+
+
+def parse_agent_response_ex(response: str) -> Tuple[str, str, str, Optional[dict]]:
+    """
+    Like parse_agent_response, but also returns the raw tool_call dict
+    ({"name":..., "arguments":...}) when the response was in tool_call JSON
+    format, else None. Used by the native_fncall path to log tool_call_args.
+    """
+    # --- Try tool_call format first (scaffold for SFT models) ---
+    tool_call_result = _try_parse_tool_call_format(response)
+    if tool_call_result is not None:
+        thought, interaction_object, action = tool_call_result
+        tool_data = _extract_json_from_text(response)
+        return thought, interaction_object, action, tool_data
+
+    # --- Tolerant fallback for provider-native tool-call styles (e.g. GLM) ---
+    native_result = _try_parse_native_toolcall_fallback(response)
+    if native_result is not None:
+        return native_result
+
+    thought, interaction_object, action = _parse_react_format(response)
+    return thought, interaction_object, action, None
+
+
 def parse_agent_response(response: str) -> Tuple[str, str, str]:
     """
     Parse the agent's response into thought, interaction object, and action.
-    (Copied/adapted from experiments/eval_react_bird_interact.py)
+    Supports both standard ReAct format (<thought>/<interaction_object>/<action>)
+    and tool_call JSON format (<tool_call>{"name":...,"arguments":...}</tool_call>).
     """
+    thought, interaction_object, action, _ = parse_agent_response_ex(response)
+    return thought, interaction_object, action
+
+
+def _parse_react_format(response: str) -> Tuple[str, str, str]:
+    """Standard ReAct (<thought>/<interaction_object>/<action>) parsing."""
+    # --- Standard ReAct format parsing ---
     thought = ""
     interaction_object = ""
     action = ""
@@ -70,35 +373,31 @@ def parse_agent_response(response: str) -> Tuple[str, str, str]:
     if thought_match:
         thought = thought_match.group(1).strip()
     else:
-        # Fallback: Try to find a line starting with Thought:
         lines = response.split('\n')
         for line in lines:
             if line.strip().lower().startswith("thought:"):
                 thought = line.split(":", 1)[1].strip()
                 break
         if not thought:
-            thought = lines[0] if lines else "" # Fallback to first line
+            thought = lines[0] if lines else ""
 
     # Extract interaction object
     object_match = re.search(r'<interaction_object>(.*?)</interaction_object>', response, re.DOTALL)
     if object_match:
         interaction_object = object_match.group(1).strip()
     else:
-        # Fallback: Infer from action keywords
         if any(kw in response for kw in ["ask(", "submit("]):
             interaction_object = "User"
         elif any(kw in response for kw in ["execute(", "get_schema(", "get_column_meaning(", "get_knowledge_definition("]):
              interaction_object = "Environment"
         else:
-             # Default or further inference needed
-             interaction_object = "Environment" # Default assumption
+             interaction_object = "Environment"
 
     # Extract action
     action_match = re.search(r'<action>(.*?)</action>', response, re.DOTALL)
     if action_match:
         action = action_match.group(1).strip()
     else:
-        # Fallback: Find the line likely containing the action
         lines = response.split('\n')
         for line in reversed(lines):
             line_stripped = line.strip()
@@ -109,11 +408,10 @@ def parse_agent_response(response: str) -> Tuple[str, str, str]:
                 action = line_stripped
                 break
         if not action:
-             action = lines[-1].strip() if lines else "" # Fallback to last line
+             action = lines[-1].strip() if lines else ""
 
     # Basic validation/cleanup
     if interaction_object not in ["User", "Environment"]:
-        # Attempt to correct based on action
         if action.startswith("ask(") or action.startswith("submit("):
             interaction_object = "User"
         else:

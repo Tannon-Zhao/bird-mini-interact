@@ -23,6 +23,12 @@ USER_SIM_MODE="encoder_decoder" # "vanilla" or "encoder_decoder"
 USER_SIM_PROMPT_VERSION="v2"
 # --- Budget & Turn Limits ---
 MAX_TURNS=60  # Match the max turns from reference script
+AGENT_MAX_TOKENS=3000
+CONTEXT_WINDOW=""
+
+# --- Agent IO protocol ---
+# react_text (default, legacy ReAct prompt) | native_fncall (demo-style messages)
+AGENT_CHAT_MODE="react_text"
 
 # --- Output & Run Configuration ---
 
@@ -41,12 +47,15 @@ LOG_LEVEL="WARNING"
 while (( "$#" )); do
   case "$1" in
     --data_path=*) DATA_PATH="${1#*=}"; shift ;;
-    --agent_models=*) AGENT_MODELS="${1#*=}"; shift ;;
+    --agent_models=*) IFS=',' read -r -a AGENT_MODEL_NAMES <<< "${1#*=}"; shift ;;
+    --agent_chat_mode=*) AGENT_CHAT_MODE="${1#*=}"; shift ;;
     --user_model=*) USER_MODEL_NAME="${1#*=}"; shift ;;
     --user_sim_mode=*) USER_SIM_MODE="${1#*=}"; shift ;;
     --user_sim_prompt_version=*) USER_SIM_PROMPT_VERSION="${1#*=}"; shift ;;
-    --budgets=*) PATIENCE_BUDGETS="${1#*=}"; shift ;;
+    --budgets=*) IFS=',' read -r -a PATIENCE_BUDGETS <<< "${1#*=}"; shift ;;
     --max_turns=*) MAX_TURNS="${1#*=}"; shift ;;
+    --agent_max_tokens=*) AGENT_MAX_TOKENS="${1#*=}"; shift ;;
+    --context_window=*) CONTEXT_WINDOW="${1#*=}"; shift ;;
     --base_output_dir=*) BASE_OUTPUT_DIR="${1#*=}"; shift ;;
     --num_threads=*) NUM_THREADS="${1#*=}"; shift ;;
     --limit=*) LIMIT="${1#*=}"; shift ;;
@@ -62,6 +71,7 @@ while (( "$#" )); do
       echo "Options:"
       echo "  --data_path=PATH         Path to BIRD-Interact dataset (default: $DATA_PATH)"
       echo "  --agent_models=M1,M2     Comma-separated agent model names (default: ${AGENT_MODEL_NAMES[*]})"
+      echo "  --agent_chat_mode=MODE   'react_text' or 'native_fncall' (default: $AGENT_CHAT_MODE)"
       echo "  --user_model=MODEL       User simulator model name (default: $USER_MODEL_NAME)"
       echo "  --user_sim_mode=MODE     'vanilla' or 'encoder_decoder' (default: $USER_SIM_MODE)"
       echo "  --user_sim_prompt_version two versions: v1 and v2. v2 is recommended"
@@ -88,6 +98,11 @@ if [ "$USER_SIM_MODE" != "vanilla" ] && [ "$USER_SIM_MODE" != "encoder_decoder" 
     exit 1
 fi
 
+if [ "$AGENT_CHAT_MODE" != "react_text" ] && [ "$AGENT_CHAT_MODE" != "native_fncall" ]; then
+    echo "Error: --agent_chat_mode must be 'react_text' or 'native_fncall'."
+    exit 1
+fi
+
 # --- Function to Run a Single Experiment Configuration ---
 run_single_config() {
     local agent_model=$1
@@ -102,6 +117,7 @@ run_single_config() {
     echo "-----------------------------------------------------"
     echo "Running Configuration:"
     echo "  Agent Model:      $agent_model"
+    echo "  Agent Chat Mode:  $AGENT_CHAT_MODE"
     echo "  Patience Budget:  $patience_budget"
     echo "  User Model:       $USER_MODEL_NAME"
     echo "  User Sim Mode:    $USER_SIM_MODE"
@@ -125,15 +141,20 @@ run_single_config() {
     mkdir -p "$exp_output_dir"
 
     # Build command for batch_run_bird_interact/main.py
-    CMD="PYTHONPATH=$(pwd) python batch_run_bird_interact/main.py"
+    CMD="PYTHONPATH=$(pwd) /home/tyzhao/workspace/miniconda3/envs/bird/bin/python batch_run_bird_interact/main.py"
     CMD+=" --data_path "$DATA_PATH""
     CMD+=" --output_path "$output_file""
     CMD+=" --agent_model "$agent_model""
+    CMD+=" --agent_chat_mode $AGENT_CHAT_MODE"
     CMD+=" --user_model "$USER_MODEL_NAME""
     CMD+=" --user_sim_mode "$USER_SIM_MODE""
     CMD+=" --user_sim_prompt_version "$USER_SIM_PROMPT_VERSION""
     CMD+=" --user_patience_budget $patience_budget"
     CMD+=" --max_turns $MAX_TURNS"
+    CMD+=" --agent_max_tokens $AGENT_MAX_TOKENS"
+    if [ -n "$CONTEXT_WINDOW" ]; then
+        CMD+=" --context_window $CONTEXT_WINDOW"
+    fi
     CMD+=" --num_threads $NUM_THREADS"
     CMD+=" --start_index $START_INDEX"
     CMD+=" --log_file "$log_file""

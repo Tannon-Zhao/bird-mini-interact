@@ -2,6 +2,7 @@ import argparse
 import os
 import json
 import time
+import random
 import itertools
 import threading
 import traceback
@@ -364,11 +365,13 @@ def api_request(messages, engine, client, backend, **kwargs):
             is_retryable = True
             if is_retryable and attempt < retries - 1:
                 logging.error(f"ERROR: {e}")
+                jitter = random.uniform(0, retry_delay * 0.3)
+                wait_time = min(retry_delay + jitter, 120)
                 logging.info(
-                    f"Retryable error detected. Waiting {retry_delay} seconds before retry..."
+                    f"Retryable error detected. Waiting {wait_time:.1f} seconds before retry (attempt {attempt + 1}/{retries})..."
                 )
-                time.sleep(min(retry_delay, 40))
-                retry_delay *= 1.5  # Exponential backoff (optional)
+                time.sleep(wait_time)
+                retry_delay *= 1.5
                 # Key rotation specifically for genai backend on retry
                 if backend == "genai" and gemini_key_cycle:
                     logging.info("Rotating GenAI API key for retry...")
@@ -387,13 +390,14 @@ def call_api_model(
     messages,
     model_name,
     temperature=0,
-    max_tokens=6000,  # Default max_tokens used if not overridden
+    max_tokens=3000,  # Default max_tokens used if not overridden
     top_p=1,
     frequency_penalty=0,  # Note: May not be supported by all backends
     presence_penalty=0,  # Note: May not be supported by all backends
     # timeout=10, # Timeout not directly used in current api_request logic
     stop=None,
     return_format="",  # Note: May not be supported by all backends
+    role="user",  # "agent" reads from env vars, "user" reads from config
 ):
     """
     Sets up the correct backend client + model engine, then calls 'api_request'.
@@ -486,15 +490,21 @@ def call_api_model(
         # Key configuration happens within api_request for genai backend during retry/initial call
         client = genai.GenerativeModel(engine)
         backend = "genai"
-    elif model_name in [
-        "deepseek/deepseek-r1-0528"
-    ]:
+    elif "deepseek" in model_name or "Deepseek" in model_name or "qwen" in model_name or "Qwen" in model_name:
         engine = model_name
-        client = OpenAI(
-            base_url=model_config["openrouter"]["base_url"],
-            api_key=model_config["openrouter"]["api_key"],
-        )
+        if role == "agent":
+            client = OpenAI(
+                base_url=os.environ.get("AGENT_BASE_URL", model_config["openrouter"]["base_url"]),
+                api_key=os.environ.get("AGENT_API_KEY", model_config["openrouter"]["api_key"]),
+            )
+        else:
+            client = OpenAI(
+                base_url=model_config["openrouter"]["base_url"],
+                api_key=model_config["openrouter"]["api_key"],
+            )
         backend = "openai"
+        temperature = 0.6
+        top_p = 0.95
     elif model_name in [
         "gpt-4o-2024-11-20",
         "claude-3-7-sonnet-20250219#thinking",
@@ -505,18 +515,34 @@ def call_api_model(
         "o3",
         "o1-preview-2024-09-12",
         "gpt-4.1",
+        "gpt-4o",
         "o4-mini",
         "claude-sonnet-4-20250514",
         "gemini-2.5-flash-preview-thinking",
-        "qwen3-235b-a22b",
+        "qwen3-235b-a22b-instruct-2507",
+        "qwen3.5-27b",
+        "qwen3-30b-a3b",
+        "qwen3-30b-a3b-sft-v10",
+        "qwen3-30b-a3b-r014native",
+        "glm5.1",
+        "deepseek-v3",
         "llama4-maverick-instruct-basic",
         "llama4-scout-instruct-basic",
+        "Pro/zai-org/GLM-5.1",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "/data1/tyzhao/tmp/structured-sft/qwen3-30b-a3b-hf-expQ"
     ]:
         engine = model_name
-        client = OpenAI(
-            base_url=model_config["openai"]["base_url"],
-            api_key=model_config["openai"]["api_key"],
-        )
+        if role == "agent":
+            client = OpenAI(
+                base_url=os.environ.get("AGENT_BASE_URL", model_config["openai"]["base_url"]),
+                api_key=os.environ.get("AGENT_API_KEY", model_config["openai"]["api_key"]),
+            )
+        else:
+            client = OpenAI(
+                base_url=model_config["openai"]["base_url"],
+                api_key=model_config["openai"]["api_key"],
+            )
         backend = "openai"
     else:
         logging.error(f"ERROR: Unsupported model name: {model_name}")
@@ -528,7 +554,7 @@ def call_api_model(
             f"Could not configure client or backend for model: {model_name}"
         )
 
-    if model_name in ["claude-3-7-sonnet-20250219#thinking", "o3-mini-2025-01-31", "o1-mini","o3", "o1-preview-2024-09-12", "o4-mini", "deepseek/deepseek-r1-0528"]:
+    if model_name in ["claude-3-7-sonnet-20250219#thinking", "o3-mini-2025-01-31", "o1-mini","o3", "o1-preview-2024-09-12", "o4-mini", "deepseek/deepseek-r1-0528", "qwen3-30b-a3b-r014native"]:
         reasoning = True
 
     kwargs = {
@@ -545,13 +571,20 @@ def call_api_model(
     return api_request(messages, engine, client, backend, **kwargs)
 
 
-def worker_function(task, data_list, output_path, lock, stop=None, max_tokens=6000):
+def worker_function(task, data_list, output_path, lock, stop=None, max_tokens=3000, role="user"):
     """
     Processes a single prompt with robust error handling and logging.
     Writes result (success or error) to the output file incrementally.
     """
     prompt, idx, model_name, return_format = task
-    messages = [{"role": "user", "content": prompt}]
+    # Native function-calling mode: data_list[idx] carries a full messages array.
+    # Legacy mode: wrap the single prompt string as one user message.
+    if idx < len(data_list) and isinstance(data_list[idx], dict) and data_list[idx].get("messages"):
+        messages = data_list[idx]["messages"]
+    elif isinstance(prompt, list):
+        messages = prompt
+    else:
+        messages = [{"role": "user", "content": prompt}]
     reasoning_content = None
     token_usage = None
     # Default to error message in case of failure
@@ -559,19 +592,21 @@ def worker_function(task, data_list, output_path, lock, stop=None, max_tokens=60
     processed_successfully = False  # Flag to track success
     current_thread_name = threading.current_thread().name
 
+    # Use per-sample max_tokens if provided in data_list, otherwise fall back to batch default
+    effective_max_tokens = data_list[idx].get("max_tokens", max_tokens) if idx < len(data_list) else max_tokens
+
     try:
         logging.debug(f"Worker {current_thread_name} START processing index {idx} with model {model_name}")
 
-        # Core API call logic
+        time.sleep(random.uniform(0.5, 3.0))
+
         response_tuple = call_api_model(
             messages,
             model_name,
             return_format=return_format,
-            # You might need to pass temperature, max_tokens etc. here if
-            # call_api_model doesn't get them from args or has fixed defaults
-            # that need overriding per task.
-            max_tokens=max_tokens, # Example if needed
+            max_tokens=effective_max_tokens,
             stop=stop,
+            role=role,
         )
 
         # Validate response structure
@@ -694,7 +729,8 @@ def collect_response_from_api(
     start_index=0,
     return_format="",
     stop=None,
-    max_tokens=6000,
+    max_tokens=3000,
+    role="user",  # "agent" reads from env vars, "user" reads from config
 ):
     """
     Uses ThreadPoolExecutor to process prompts concurrently.
@@ -746,7 +782,7 @@ def collect_response_from_api(
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             # Submit tasks
             futures = {
-                executor.submit(worker_function, t, data_list, output_path, lock, stop=stop, max_tokens=max_tokens): t
+                executor.submit(worker_function, t, data_list, output_path, lock, stop=stop, max_tokens=max_tokens, role=role): t
                 for t in tasks
             }
 
@@ -772,7 +808,7 @@ def collect_response_from_api(
                     failed_tasks += 1
     else:
         for task in tasks:
-            worker_function(task, data_list, output_path, lock, stop=stop, max_tokens=max_tokens)
+            worker_function(task, data_list, output_path, lock, stop=stop, max_tokens=max_tokens, role=role)
 
 
     logging.info(

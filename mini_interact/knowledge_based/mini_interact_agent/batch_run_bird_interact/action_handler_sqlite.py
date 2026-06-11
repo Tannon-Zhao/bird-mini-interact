@@ -6,6 +6,7 @@ from typing import Dict, Any, Tuple, Optional
 
 from src.envs.bird_interact_env.test_case_utils_sqlite.db_utils import execute_queries, reset_and_restore_database
 from src.envs.bird_interact_env.test_case_utils_sqlite.test_utils import test_case_default
+from batch_run_bird_interact.action_format_utils import format_unknown_environment_observation
 
 # Set up logger
 import logging
@@ -253,14 +254,7 @@ def execute_env_action(action: str, sample_status: 'SampleStatus', data_path_bas
             success = True
 
         else:
-            observation = f"""Unknown Environment action: {action} Your availabel actions to Database are 
-            execute(sql): Execute a SQL query
-            get_schema(): Get the schema of the database
-            get_all_column_meanings(): Get all column meanings
-            get_all_external_knowledge_names(): Get all external knowledge names
-            get_knowledge_definition(knowledge_name): Get the definition of a specific knowledge
-            get_all_knowledge_definitions(): Get all knowledge definitions
-            """
+            observation = format_unknown_environment_observation(action)
             success = False
 
     except sqlite3.Error as db_err:

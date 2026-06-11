@@ -21,15 +21,36 @@ from batch_run_bird_interact import action_handler as pg_handler
 from batch_run_bird_interact import action_handler_sqlite as sqlite_handler
 from batch_run_bird_interact.prompt_utils import (
     build_initial_agent_prompt,
+    build_initial_agent_prompt_dispatch,
     get_agent_prompt_for_turn,
     parse_agent_response,
+    parse_agent_response_ex,
     build_user_encoder_prompt, # Assuming encoder/decoder for user sim
     build_user_decoder_prompt,
     parse_encoder_response
 )
+from batch_run_bird_interact.native_messages_builder import (
+    get_native_messages_for_turn,
+    _gen_tool_call_id,
+)
+from batch_run_bird_interact.action_format_utils import (
+    classify_agent_api_failure,
+    is_valid_parsed_action,
+    truncate_action_for_log,
+)
 
-# Set up logger (consider using a more robust logging setup)
+INVALID_ACTION_FORMAT_OBS = (
+    "Error: Invalid action format. The format should be in "
+    "<thought>...</thought><interaction_object>...</interaction_object><action>...</action>. "
+    "Action content must be execute(...), get_*(...), ask(...), or submit(...), "
+    "without XML tags inside the action string."
+)
+
 import logging
+
+def estimate_token_count(text: str) -> int:
+    """Rough token count estimate. ~3.5 chars per token for mixed English/code content."""
+    return int(len(text) / 3.5)
 
 def setup_logging(verbose: bool = False, log_level: str = "INFO", log_file: str = None):
     """Configure logging with the specified verbosity and level.
@@ -223,7 +244,8 @@ def load_progress(output_path: str) -> Optional[List[SampleStatus]]:
                         last_reward=item.get('last_reward'),
                         last_user_response=item.get('last_user_response'),
                         force_submit=item.get('force_submit', False),
-                        successful_phase1_sql=item.get('successful_phase1_sql')
+                        successful_phase1_sql=item.get('successful_phase1_sql'),
+                        native_base_messages=item.get('native_base_messages')
                     )
                     all_statuses.append(status)
                 except Exception as e:
@@ -393,6 +415,23 @@ def run_batch_evaluation(args):
         all_statuses = load_progress(args.output_path)
         if all_statuses:
             logger.warning(f"Successfully loaded {len(all_statuses)} statuses from previous run")
+            # Guard against resuming a run under a different agent_chat_mode than it
+            # was started with: the message/prompt shapes are incompatible.
+            had_native = any(getattr(s, "native_base_messages", None) for s in all_statuses)
+            has_history = any(s.interaction_history for s in all_statuses)
+            if has_history:
+                if had_native and args.agent_chat_mode != 'native_fncall':
+                    raise SystemExit(
+                        "Resume mismatch: progress file was produced in native_fncall mode but "
+                        "--agent_chat_mode is not native_fncall. Re-run with --agent_chat_mode=native_fncall "
+                        "or use a fresh --output_path."
+                    )
+                if not had_native and args.agent_chat_mode == 'native_fncall':
+                    raise SystemExit(
+                        "Resume mismatch: progress file was produced in react_text mode but "
+                        "--agent_chat_mode=native_fncall was requested. Re-run with --agent_chat_mode=react_text "
+                        "or use a fresh --output_path."
+                    )
             completed_turns = [s.current_turn for s in all_statuses]
             if completed_turns:
                 resume_turn = max(completed_turns)
@@ -444,7 +483,7 @@ def run_batch_evaluation(args):
             # Build and store the initial prompt (Turn 0)
             # The initial prompt is stored in status.current_prompt
             env_type = "mini_interact" if args.mini_interact else "bird_interact_sql"
-            build_initial_agent_prompt(status, {"total_budget": total_budget, "remaining_budget": remaining_budget}, env_type)
+            build_initial_agent_prompt_dispatch(status, {"total_budget": total_budget, "remaining_budget": remaining_budget}, env_type, args.agent_chat_mode)
             # Initial prompts are not directly sent to API here, but stored in status
             # The first API call will use get_agent_prompt_for_turn which returns this initial prompt
             all_statuses.append(status)
@@ -595,27 +634,52 @@ def run_batch_evaluation(args):
 
         for i, status in enumerate(active_statuses):
             status.current_turn = current_turn + 1 # Update turn number
-            full_prompt = get_agent_prompt_for_turn(status)
-            agent_prompts.append(full_prompt)
-            # Create data structure for call_api_batch
-            api_data_item = {"prompt": full_prompt, "id": status.idx} # Use sample idx as id
+            if args.agent_chat_mode == 'native_fncall':
+                # Demo-style messages array; observation truncation by char budget.
+                max_prompt_chars = None
+                if args.context_window:
+                    max_prompt_chars = int((args.context_window - args.agent_max_tokens) * 3.5)
+                messages = get_native_messages_for_turn(status, max_prompt_chars)
+                sample_max_tokens = args.agent_max_tokens
+                if args.context_window:
+                    prompt_tokens_est = sum(estimate_token_count(m["content"]) for m in messages)
+                    sample_max_tokens = min(args.agent_max_tokens, args.context_window - prompt_tokens_est)
+                    sample_max_tokens = max(sample_max_tokens, 256)
+                agent_prompts.append(messages)
+                # worker reads messages from data_list[idx]["messages"]; "prompt" kept empty for the prompt_list arg.
+                api_data_item = {"prompt": "", "messages": messages, "id": status.idx, "max_tokens": sample_max_tokens}
+            else:
+                if args.context_window:
+                    max_prompt_chars = int((args.context_window - args.agent_max_tokens) * 3.5)
+                    full_prompt = status.get_truncated_interaction_prompt(max_prompt_chars)
+                else:
+                    full_prompt = get_agent_prompt_for_turn(status)
+                agent_prompts.append(full_prompt)
+                # Per-sample max_tokens: cap based on this sample's prompt length
+                sample_max_tokens = args.agent_max_tokens
+                if args.context_window:
+                    prompt_tokens_est = estimate_token_count(full_prompt)
+                    sample_max_tokens = min(args.agent_max_tokens, args.context_window - prompt_tokens_est)
+                    sample_max_tokens = max(sample_max_tokens, 256)
+                api_data_item = {"prompt": full_prompt, "id": status.idx, "max_tokens": sample_max_tokens}
             agent_api_data.append(api_data_item)
             prompt_map[i] = status.idx # api_data index -> original status index
 
-        # 3.3 Batch call agent API
         logger.debug(f"Sending {len(agent_prompts)} prompts to agent model: {args.agent_model}")
         agent_api_start_time = time.time()
         # Decide output path for raw agent responses
         raw_agent_output = args.agent_output_path if args.agent_output_path else f"{args.output_path}.agent_raw_turn_{current_turn+1}.jsonl"
-        # Assuming collect_response_from_api is adapted to write results keyed by the 'id' provided
+        # native_fncall: stop after the first tool_call so the model emits exactly one action.
+        agent_stop = ["</tool_call>"] if args.agent_chat_mode == 'native_fncall' else ["Observation:", "\nObservation:", "Observation: "]
         collect_response_from_api(
-            prompt_list=[item['prompt'] for item in agent_api_data], # Explicitly pass prompts
+            prompt_list=[item['prompt'] for item in agent_api_data],
             model_name=args.agent_model,
-            data_list=agent_api_data, # Pass data with prompts and IDs
+            data_list=agent_api_data,
             output_path=raw_agent_output,
             num_threads=args.num_threads,
-            stop=["Observation:", "\nObservation:", "Observation: "]
-            # start_index=0 # Process all active prompts
+            stop=agent_stop,
+            max_tokens=args.agent_max_tokens,
+            role="agent",
         )
         agent_api_duration = time.time() - agent_api_start_time
         logger.debug(f"Agent API calls completed in {agent_api_duration:.2f} seconds.")
@@ -654,11 +718,71 @@ def run_batch_evaluation(args):
             status.last_agent_response = result_data.get("response", "Error: Missing response field")
             # TODO: Store token usage if needed: status.token_usage.update(...)
 
+            # native_fncall: stop=["</tool_call>"] strips the closing tag; restore it
+            # so the raw transcript is well-formed for the parser and for SFT replay.
+            status._pending_raw_assistant = None
+            status._pending_tool_call_id = None
+            status._pending_tool_call_args = None
+            if args.agent_chat_mode == 'native_fncall':
+                resp = status.last_agent_response
+                if isinstance(resp, str) and "<tool_call>" in resp and not resp.rstrip().endswith("</tool_call>"):
+                    status.last_agent_response = resp.rstrip() + "\n</tool_call>"
+
+            api_error_obs = classify_agent_api_failure(status.last_agent_response)
+            if api_error_obs:
+                logger.warning(
+                    f"Sample {status.idx}: Agent API failure; ending task without parsing response."
+                )
+                status.task_finished = True
+                status.last_observation = api_error_obs
+                budget_info = {
+                    "remaining_budget": status.remaining_budget,
+                    "total_budget": status.total_budget,
+                }
+                status.add_turn_log(
+                    "",
+                    "",
+                    truncate_action_for_log(status.last_agent_response),
+                    api_error_obs,
+                    0.0,
+                    budget_info,
+                )
+                continue
+
             # Parse thought, object, action
-            thought, obj, action = parse_agent_response(status.last_agent_response)
+            thought, obj, action, tool_data = parse_agent_response_ex(status.last_agent_response)
             status.parsed_thought = thought
             status.parsed_action_object = obj
             status.parsed_action = action
+
+            # In native mode, stamp per-turn extras so every add_turn_log site below
+            # records the raw assistant content + deterministic tool_call id/args.
+            if args.agent_chat_mode == 'native_fncall':
+                status._pending_raw_assistant = status.last_agent_response
+                status._pending_tool_call_id = _gen_tool_call_id(status.current_turn, action)
+                status._pending_tool_call_args = tool_data
+
+            if not is_valid_parsed_action(action):
+                logger.warning(
+                    f"Sample {status.idx}: Rejected malformed action (not sent to environment): "
+                    f"{truncate_action_for_log(action)!r}"
+                )
+                status.last_observation = INVALID_ACTION_FORMAT_OBS
+                update_budget(status)
+                budget_info_after_action = {
+                    "remaining_budget": status.remaining_budget,
+                    "total_budget": status.total_budget,
+                    "force_submit": status.force_submit,
+                }
+                status.add_turn_log(
+                    thought,
+                    obj,
+                    truncate_action_for_log(action),
+                    status.last_observation,
+                    0.0,
+                    budget_info_after_action,
+                )
+                continue
 
             # Validate action based on force_submit flag
             if status.force_submit and not action.startswith("submit("):
@@ -671,7 +795,14 @@ def run_batch_evaluation(args):
                 status.last_observation = "[SYSTEM NOTE: Budget depleted. Agent failed to submit. Task failed.]"
                 status.task_finished = True
                 # Log the turn even if failed
-                status.add_turn_log(thought, obj, action, status.last_observation, 0.0, {"remaining_budget": status.remaining_budget, "total_budget": status.total_budget})
+                status.add_turn_log(
+                    thought,
+                    obj,
+                    truncate_action_for_log(action),
+                    status.last_observation,
+                    0.0,
+                    {"remaining_budget": status.remaining_budget, "total_budget": status.total_budget},
+                )
                 continue
 
             # 3.5 Update Budget *before* executing action
@@ -694,13 +825,27 @@ def run_batch_evaluation(args):
                     logger.warning(f"Sample {status.idx}: Could not parse SQL from submit action: {action}. Treating as error.")
                     status.last_observation = "Error: Invalid submit action format."
                     # Log the turn with error
-                    status.add_turn_log(thought, obj, action, status.last_observation, 0.0, budget_info_after_action)
+                    status.add_turn_log(
+                        thought,
+                        obj,
+                        truncate_action_for_log(action),
+                        status.last_observation,
+                        0.0,
+                        budget_info_after_action,
+                    )
 
             else:
                 logger.warning(f"Sample {status.idx}: Unknown action object/type: Object='{obj}', Action='{action}'")
                 status.last_observation = f"Error: Unknown action object or type. The format should be in <thought>...</thought><interaction_object>...</interaction_object><action>...</action>. And the input(s) of action content is/are stricted to STRING ENCLOSED BY SINGLE PAIR OF QUOTES OR \"\"\"YOUR ACTION HERE\"\"\"."
                 # Log the turn with error
-                status.add_turn_log(thought, obj, action, status.last_observation, 0.0, budget_info_after_action)
+                status.add_turn_log(
+                    thought,
+                    obj,
+                    truncate_action_for_log(action),
+                    status.last_observation,
+                    0.0,
+                    budget_info_after_action,
+                )
 
         # --- Execute Actions Sequentially ---
         # 3.7 Process Environment Actions
@@ -723,7 +868,14 @@ def run_batch_evaluation(args):
              status.last_observation += budget_prompt
 
              # Log this part of the turn
-             status.add_turn_log(thought, obj, action, status.last_observation, 0.0, budget_info) # Reward is 0 for env actions
+             status.add_turn_log(
+                 thought,
+                 obj,
+                 truncate_action_for_log(action),
+                 status.last_observation,
+                 0.0,
+                 budget_info,
+             )  # Reward is 0 for env actions
              logger.debug(f"Sample {status.idx}: Env Action '{action}' -> Obs: {observation[:100]}...")
 
 
@@ -776,7 +928,8 @@ def run_batch_evaluation(args):
                             model_name=args.user_model,
                             data_list=user_api_data,
                             output_path=raw_user_output,
-                            num_threads=args.user_num_threads
+                            num_threads=args.user_num_threads,
+                            role="user",
                         )
                         user_api_duration = time.time() - user_api_start_time
                         logger.debug(f"Vanilla User API calls completed in {user_api_duration:.2f} seconds.")
@@ -822,7 +975,8 @@ def run_batch_evaluation(args):
                             model_name=encoder_model,
                             data_list=encoder_api_data,
                             output_path=raw_encoder_output,
-                            num_threads=args.user_num_threads
+                            num_threads=args.user_num_threads,
+                            role="user",
                         )
                         encoder_api_duration = time.time() - encoder_api_start_time
                         logger.debug(f"User Encoder API calls completed in {encoder_api_duration:.2f} seconds.")
@@ -871,7 +1025,8 @@ def run_batch_evaluation(args):
                             model_name=decoder_model,
                             data_list=decoder_api_data,
                             output_path=raw_decoder_output,
-                            num_threads=args.user_num_threads
+                            num_threads=args.user_num_threads,
+                            role="user",
                         )
                         decoder_api_duration = time.time() - decoder_api_start_time
                         logger.debug(f"User Decoder API calls completed in {decoder_api_duration:.2f} seconds.")
@@ -1029,6 +1184,9 @@ def main():
 
     # Model Configuration
     parser.add_argument('--agent_model', type=str, default='gemini-2.0-flash-001', help='Model name for the agent')
+    parser.add_argument('--agent_chat_mode', type=str, choices=['react_text', 'native_fncall'], default='react_text',
+                        help='Agent IO protocol. react_text (default): legacy single-string ReAct prompt. '
+                             'native_fncall: demo-style multi-turn messages with <think>+<tool_call> JSON output.')
     # User Simulator Configuration
     parser.add_argument('--user_model', type=str, default='gemini-1.5-flash', help='Model name for the user simulator (used for vanilla or decoder)')
     parser.add_argument('--user_sim_mode', type=str, choices=['vanilla', 'encoder_decoder'], default='encoder_decoder', help='User simulator mode')
@@ -1048,6 +1206,8 @@ def main():
     parser.add_argument('--db_host', type=str, default='bird_interact_postgresql', help='Database host (PostgreSQL only)')
     parser.add_argument('--db_port', type=int, default=5432, help='Database port (PostgreSQL only)')
     parser.add_argument('--user_patience_budget', type=int, default=10, help='Initial user patience budget component')
+    parser.add_argument('--agent_max_tokens', type=int, default=3000, help='Max output tokens for agent model API calls')
+    parser.add_argument('--context_window', type=int, default=None, help='Limit total context (prompt+completion) to this many tokens for fair comparison with local models. If set, prompts are truncated and max_tokens is capped so prompt+completion <= context_window.')
 
     # Logging Configuration
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (DEBUG level for key modules)')
