@@ -46,6 +46,14 @@ INVALID_ACTION_FORMAT_OBS = (
     "without XML tags inside the action string."
 )
 
+INVALID_ACTION_FORMAT_OBS_NATIVE = (
+    "Error: Invalid action format. You must output a tool call in this exact format: "
+    '<tool_call>{"name": "<tool_name>", "arguments": {<args>}}</tool_call> '
+    "Available tools: execute, submit, ask, get_db_schema, get_column_meaning, "
+    "get_knowledge_definition, get_all_column_meanings, verify, get_expected_output. "
+    "Do not use XML action tags like <thought> or <action>."
+)
+
 import logging
 
 def estimate_token_count(text: str) -> int:
@@ -767,7 +775,7 @@ def run_batch_evaluation(args):
                     f"Sample {status.idx}: Rejected malformed action (not sent to environment): "
                     f"{truncate_action_for_log(action)!r}"
                 )
-                status.last_observation = INVALID_ACTION_FORMAT_OBS
+                status.last_observation = INVALID_ACTION_FORMAT_OBS_NATIVE if args.agent_chat_mode == 'native_fncall' else INVALID_ACTION_FORMAT_OBS
                 update_budget(status)
                 budget_info_after_action = {
                     "remaining_budget": status.remaining_budget,
