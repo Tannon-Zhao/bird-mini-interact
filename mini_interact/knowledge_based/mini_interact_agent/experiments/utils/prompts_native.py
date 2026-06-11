@@ -7,7 +7,7 @@ This is the SHARED spec used both by:
 
 Keep training and evaluation in lockstep: the student is trained on transcripts
 shaped exactly like what build/get_native_messages_* produce. The system prompt,
-the <think>+<tool_call> response protocol, and the <tool_response> wrapper must
+the <tool_call> response protocol, and the <tool_response> wrapper must
 match between the two sides, otherwise the model sees a distribution shift at
 eval time.
 
@@ -27,7 +27,7 @@ class TemplateNativeFnCallBirdInteract:
 
     def get_native_init_msg(self) -> str:
         """System message aligned with TemplateReActUserBirdInteract.get_init_msg(),
-        only the response format differs (native <think>/<tool_call> instead of
+        only the response format differs (native <tool_call> instead of
         ReAct <thought>/<interaction_object>/<action>)."""
         return f"""You are a helpful {self.setting} agent that interacts with a user and a database to solve the user's question.
 
@@ -39,19 +39,16 @@ Your goal is to understand the user's ambiguous question involving the external 
 - Cost of your action: each your action will cost a certain amount of user patience.
 
 # Response Protocol (Function-Calling Format)
-You think first, then call exactly one tool per turn. After each tool call you receive a tool response, then you think and act again. The cycle is: Tool Response -> Think -> Tool Call -> Tool Response -> Think -> Tool Call -> ...
+You call exactly one tool per turn. After each tool call you receive a tool response, then you act again. The cycle is: Tool Response -> Tool Call -> Tool Response -> Tool Call -> ...
 
 ## Response Format
-Given previous interaction history and current tool response (or the user's request at the beginning), you should respond using the following format:
+Given previous interaction history and current tool response (or the user's request at the beginning), you should respond with exactly one tool call:
 
-<think>
-your private reasoning about the current state
-</think>
 <tool_call>
 {{"name": "<tool_name>", "arguments": {{...}}}}
 </tool_call>
 
-Do not emit more than one <tool_call> per turn. Do not write natural-language content after </tool_call>. Tool results come back as user messages wrapped in <tool_response>...</tool_response>.
+Do not emit more than one <tool_call> per turn. Do not write natural-language content outside of <tool_call>. Tool results come back as user messages wrapped in <tool_response>...</tool_response>.
 
 ## Tool Catalog and Action Costs
 ### Environment Tools
@@ -110,7 +107,7 @@ After each tool call, you'll see a [SYSTEM NOTE] showing how much budget remains
         """One native-format toy example, rendered as a text block.
 
         Mirrors TemplateReActUserBirdInteract.get_demos() but in the native
-        protocol (<think>/<tool_call>{json}</tool_call> for the agent and
+        protocol (<tool_call>{json}</tool_call> for the agent and
         <tool_response> for results). Placed inside the FIRST user message
         (before the real query) so it carries no training loss, exactly like
         the legacy ReAct demo did. Converter and benchmark share this verbatim.
@@ -124,14 +121,6 @@ After each tool call, you'll see a [SYSTEM NOTE] showing how much budget remains
 
 User's Question: Find several calibrated alien signals detected by the observatory during the full moon phase. Show their information.
 
-<think>
-This query seems ambiguous. I need to understand:
-1. Which database tables contain information about alien signals and observatories
-2. How "full moon phase" is represented in the data
-3. What "calibrated alien signals" means and how to measure their strength
-4. What does "several" mean, 3 or more? and what information should I show?
-Let me first check the database schema.
-</think>
 <tool_call>
 {"name": "get_schema", "arguments": {}}
 </tool_call>
@@ -146,9 +135,6 @@ Database schema showing tables: Observatories(ObservID, ObservStation, ObservDat
 </result>
 </tool_response>
 
-<think>
-Now I can see there's an Observatories table with LunarStage field and a Signal field. There's also a Signals table with more details about signal strength. I need to understand what values the LunarStage field contains and how to identify a "full moon" phase.
-</think>
 <tool_call>
 {"name": "get_column_meaning", "arguments": {"table_name": "Observatories", "column_name": "LunarStage"}}
 </tool_call>
@@ -163,9 +149,6 @@ Full name: 'Lunar Stage'. Explanation: Current lunar phase during observation. V
 </result>
 </tool_response>
 
-<think>
-Great, I now know "Full" represents the full moon phase in the LunarStage column. Now I need to understand what "calibrated alien signals" means and how their strength is measured. Let me check if there's any external knowledge that could help.
-</think>
 <tool_call>
 {"name": "get_all_external_knowledge_names", "arguments": {}}
 </tool_call>
@@ -180,9 +163,6 @@ Great, I now know "Full" represents the full moon phase in the LunarStage column
 </result>
 </tool_response>
 
-<think>
-There's knowledge about "Calibrated Signal" that seems directly relevant to the user's question about "calibrated alien signals". Let me check that information.
-</think>
 <tool_call>
 {"name": "get_knowledge_definition", "arguments": {"knowledge_name": "Calibrated Signal"}}
 </tool_call>
@@ -197,9 +177,6 @@ There's knowledge about "Calibrated Signal" that seems directly relevant to the 
 </result>
 </tool_response>
 
-<think>
-Now I understand that "calibrated alien signals" refers to signals with strength > 10. But I am not sure how many results does the user want. I need to ask the user for clarification.
-</think>
 <tool_call>
 {"name": "ask", "arguments": {"question": "How many results do you want? What do you mean about \\"several\\"?"}}
 </tool_call>
@@ -214,9 +191,6 @@ I want three results sorted by signal strength.
 </result>
 </tool_response>
 
-<think>
-What output field should I show? I need to ask the user for clarification.
-</think>
 <tool_call>
 {"name": "ask", "arguments": {"question": "Do you want to get the signal name and signal strength?"}}
 </tool_call>
@@ -231,14 +205,6 @@ I just want the signal id.
 </result>
 </tool_response>
 
-<think>
-Now I have all the information needed to write the SQL query. I need to:
-1. Join the Observatories and Signals tables
-2. Filter for observations during the Full moon phase
-3. Filter for signals with strength > 10
-4. Sort by signal strength
-5. The user want the top 3 results with just the signal id
-</think>
 <tool_call>
 {"name": "execute", "arguments": {"sql": "SELECT s.SignalID FROM Observatories o JOIN Signals s ON o.Signal = s.SignalID WHERE o.LunarStage = 'Full' AND s.SignalStrength > 10 ORDER BY s.SignalStrength DESC LIMIT 3"}}
 </tool_call>
@@ -253,9 +219,6 @@ Now I have all the information needed to write the SQL query. I need to:
 </result>
 </tool_response>
 
-<think>
-I found the signal ids of the top 3 calibrated alien signals detected during full moon phases. Let me submit this SQL to the user.
-</think>
 <tool_call>
 {"name": "submit", "arguments": {"sql": "SELECT s.SignalID FROM Observatories o JOIN Signals s ON o.Signal = s.SignalID WHERE o.LunarStage = 'Full' AND s.SignalStrength > 10 ORDER BY s.SignalStrength DESC LIMIT 3"}}
 </tool_call>
