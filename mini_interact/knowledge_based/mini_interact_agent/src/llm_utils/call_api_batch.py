@@ -490,6 +490,41 @@ def call_api_model(
         # Key configuration happens within api_request for genai backend during retry/initial call
         client = genai.GenerativeModel(engine)
         backend = "genai"
+
+    elif model_name in [
+         "qwen3-30b-a3b-r014native",
+    ]:
+        if role == "agent":
+            client = OpenAI(
+                base_url=os.environ.get("AGENT_BASE_URL", model_config["openrouter"]["base_url"]),
+                api_key=os.environ.get("AGENT_API_KEY", model_config["openrouter"]["api_key"]),
+            )
+        else:
+            client = OpenAI(
+                base_url=model_config["openrouter"]["base_url"],
+                api_key=model_config["openrouter"]["api_key"],
+            )
+        backend = "openai"
+        temperature = 0.6
+        top_p = 0.95
+
+    elif model_name in [
+         "qwen3-30b-a3b-round013",
+    ]:
+        if role == "agent":
+            client = OpenAI(
+                base_url=os.environ.get("AGENT_BASE_URL", model_config["openrouter"]["base_url"]),
+                api_key=os.environ.get("AGENT_API_KEY", model_config["openrouter"]["api_key"]),
+            )
+        else:
+            client = OpenAI(
+                base_url=model_config["openrouter"]["base_url"],
+                api_key=model_config["openrouter"]["api_key"],
+            )
+        backend = "openai"
+        temperature = 0.7
+        top_p = 0.8
+
     elif "deepseek" in model_name or "Deepseek" in model_name or "qwen" in model_name or "Qwen" in model_name:
         engine = model_name
         if role == "agent":
